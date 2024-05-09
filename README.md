@@ -32,7 +32,4 @@ El desarrollo del proyecto se divide en varias fases:
 ## Objetivos
 El principal objetivo es proporcionar una herramienta potente y flexible para el empaquetado de archivos, con mejoras específicas en la gestión del espacio y la eficiencia operativa. StarPack será una valiosa adición a las herramientas de manejo de archivos en entornos UNIX.
 
-## Contacto
-Para más información, preguntas o colaboraciones, pueden contactar a los miembros del equipo mediante sus correos institucionales:
-- Camilo Sánchez Rodríguez: camilo.sanchez@example.edu
-- Mario Barboza Artavia: mario.barboza@example.edu
+
