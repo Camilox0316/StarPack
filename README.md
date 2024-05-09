@@ -15,7 +15,7 @@ StarPack soportará las siguientes operaciones:
 - **Verbose** (`-v`): Muestra información detallada durante la ejecución de las operaciones.
 
 ## Tecnologías
-- **Lenguaje de Programación**: C/C++
+- **Lenguaje de Programación**: C
 - **Sistemas Operativos**: Compatible con sistemas basados en UNIX.
 
 ## Miembros del Equipo
