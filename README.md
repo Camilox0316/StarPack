@@ -19,8 +19,8 @@ StarPack soportará las siguientes operaciones:
 - **Sistemas Operativos**: Compatible con sistemas basados en UNIX.
 
 ## Miembros del Equipo
-- **Camilo Sánchez Rodríguez** - Estudiante de Ingeniería Informática, matrícula 2021081146.
-- **Mario Barboza Artavia** - Estudiante de Ingeniería Informática, matrícula 2021075241.
+- **Camilo Sánchez Rodríguez** - Estudiante de Ingeniería en computación, carné 2021081146.
+- **Mario Barboza Artavia** - Estudiante de Ingeniería en computación, carné 2021075241.
 
 ## Planificación
 El desarrollo del proyecto se divide en varias fases:
