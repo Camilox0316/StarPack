@@ -79,6 +79,7 @@ void create_archive(char *output_filename, int num_files, char *input_filenames[
         fseek(input_file, 0, SEEK_SET);
         int num_blocks_needed = (file_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
+        printf("Writing to archive: %s, size: %d\n", input_filenames[i], file_size);
         int start_block = assign_blocks(&fat, num_blocks_needed);
         if (start_block == -1) {
             fprintf(stderr, "Failed to allocate space for file %s\n", input_filenames[i]);
@@ -90,6 +91,7 @@ void create_archive(char *output_filename, int num_files, char *input_filenames[
         char buffer[BLOCK_SIZE];
         int bytes_read;
         while ((bytes_read = fread(buffer, 1, BLOCK_SIZE, input_file)) > 0) {
+            printf("Read %d bytes, writing to block starting at %ld\n", bytes_read, (long)(start_block * BLOCK_SIZE));
             fwrite(buffer, 1, bytes_read, output_file);
         }
 
@@ -107,6 +109,84 @@ void create_archive(char *output_filename, int num_files, char *input_filenames[
     fclose(output_file);
 }
 
+
+void extract_archive(char *archive_filename) {
+    FILE *archive_file = fopen(archive_filename, "rb");
+    if (!archive_file) {
+        perror("Failed to open archive file for reading");
+        return;
+    }
+
+    FAT fat;
+    if (fread(&fat, sizeof(FAT), 1, archive_file) != 1) {
+        perror("Failed to read FAT from archive file");
+        fclose(archive_file);
+        return;
+    }
+
+    for (int i = 0; i < MAX_FILES; i++) {
+        if (fat.files[i].file_size == 0) {
+            break;
+        }
+
+        char *output_filename = fat.files[i].filename;
+        FILE *output_file = fopen(output_filename, "wb");
+        if (!output_file) {
+            fprintf(stderr, "Failed to open output file %s for writing\n", output_filename);
+            continue;
+        }
+
+        int bytes_to_read = fat.files[i].file_size;
+        fseek(archive_file, fat.files[i].start_block * BLOCK_SIZE, SEEK_SET);
+        printf("Extracting file: %s, size: %d\n", output_filename, fat.files[i].file_size);
+        char buffer[BLOCK_SIZE];
+        while (bytes_to_read > 0) {
+            memset(buffer, 0, BLOCK_SIZE);  // Clear the buffer before reading
+            int bytes_read = fread(buffer, 1, (bytes_to_read > BLOCK_SIZE ? BLOCK_SIZE : bytes_to_read), archive_file);
+            if (bytes_read <= 0) {
+                perror("Failed to read data from archive file");
+                break;
+            }
+            printf("Read %d bytes\n", bytes_read);
+            fwrite(buffer, 1, bytes_read, output_file);
+            bytes_to_read -= bytes_read;
+        }
+
+        fclose(output_file);
+    }
+
+    fclose(archive_file);
+}
+
+void list_archive_contents(char *archive_filename) {
+    FILE *archive_file = fopen(archive_filename, "rb");
+    if (!archive_file) {
+        perror("Failed to open archive file for reading");
+        return;
+    }
+
+    FAT fat;
+    if (fread(&fat, sizeof(FAT), 1, archive_file) != 1) {
+        perror("Failed to read FAT from archive file");
+        fclose(archive_file);
+        return;
+    }
+
+    printf("List of files in the archive:\n");
+    for (int i = 0; i < MAX_FILES; i++) {
+        if (fat.files[i].file_size == 0) {  // Assume file_size 0 as the end of valid entries
+            break;
+        }
+        printf("File: %s, Size: %d bytes, Blocks: %d\n",
+               fat.files[i].filename,
+               fat.files[i].file_size,
+               fat.files[i].num_blocks);
+    }
+
+    fclose(archive_file);
+}
+
+
 void print_usage(char *program_name) {
     printf("Uso: %s [opciones] [argumentos]\n", program_name);
     printf("Opciones:\n");
@@ -122,14 +202,14 @@ void print_usage(char *program_name) {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 3) {
+    if (argc < 2) {
         print_usage(argv[0]);
         return EXIT_FAILURE;
     }
 
     int opt;
-    int verbose = 0;
-    CreateArgs create_args = {0};
+    int create_flag = 0, extract_flag = 0, list_flag = 0;
+    char *filename = NULL;
 
     static struct option long_options[] = {
         {"create", no_argument, 0, 'c'},
@@ -144,23 +224,22 @@ int main(int argc, char *argv[]) {
         {0, 0, 0, 0}
     };
 
-    int create_flag = 0;
-
     while ((opt = getopt_long(argc, argv, "cxtduvrf:pa", long_options, NULL)) != -1) {
         switch (opt) {
             case 'c':
                 create_flag = 1;
                 break;
+            case 'x':
+                extract_flag = 1;
+                break;
+            case 't':
+                list_flag = 1;
+                break;
             case 'f':
-                if (create_flag) {
-                    create_args.output_filename = optarg;
-                    create_args.num_files = argc - optind;
-                    create_args.input_filenames = &argv[optind];
-                }
+                filename = optarg;
                 break;
             case 'v':
-                verbose = 1;
-                printf("Modo verboso activado.\n");
+                // Implement verbose or other flags as needed
                 break;
             default:
                 print_usage(argv[0]);
@@ -168,15 +247,21 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if (create_flag && create_args.output_filename) {
-        if (create_args.num_files > 0) {
-            printf("Creando archivo: %s con %d archivos de entrada.\n", create_args.output_filename, create_args.num_files);
-            create_archive(create_args.output_filename, create_args.num_files, create_args.input_filenames);
-        } else {
-            fprintf(stderr, "No se especificaron archivos de entrada para la creación.\n");
-            return EXIT_FAILURE;
-        }
+    if (create_flag && filename) {
+        printf("Creating an archive with the file: %s\n", filename);
+        // Assuming that you process the rest of the files after '-f' in `create_archive`
+        create_archive(filename, argc - optind, &argv[optind]);
+    } else if (extract_flag && filename) {
+        printf("Extracting files from the archive: %s\n", filename);
+        extract_archive(filename);
+    } else if (list_flag && filename) {
+        printf("Listing contents of the archive: %s\n", filename);
+        list_archive_contents(filename);
+    } else {
+        fprintf(stderr, "Invalid operation or no filename specified.\n");
+        print_usage(argv[0]);
+        return EXIT_FAILURE;
     }
- 
+
     return 0;
 }
