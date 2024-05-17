@@ -1,191 +1,552 @@
 #include <stdio.h>
+#include <unistd.h>
+#include <stdbool.h>
 #include <stdlib.h>
-#include <string.h>
 #include <getopt.h>
+#include <string.h>
 
-#define MAX_FILES 100       // Máximo de archivos que el sistema puede manejar
-#define MAX_BLOCKS 1000     // Máximo de bloques que el sistema puede manejar
-#define BLOCK_SIZE 262144   // Tamaño de cada bloque de datos (256K)
-
-typedef struct {
-    char filename[100];      // Nombre del archivo, con un máximo de 100 caracteres
-    int start_block;         // Índice del primer bloque en el archivo empaquetado
-    int num_blocks;          // Número de bloques que ocupa el archivo
-    int file_size;           // Tamaño total del archivo en bytes
-} FileMetadata;
+#define KILOBYTES 256 // 256 KB
+#define BLOCK_SIZE KILOBYTES * 1024 
+#define MAX_ENTRIES 100 
+#define MAX_NAME_LENGTH 256
+#define MAX_BLOCKS_PER_ENTRY 64 
+#define TOTAL_BLOCKS MAX_BLOCKS_PER_ENTRY * MAX_ENTRIES
 
 typedef struct {
-    FileMetadata files[MAX_FILES];       // Array de metadatos de archivo
-    int free_blocks[MAX_BLOCKS];         // Lista de estados de bloques (0 libre, 1 ocupado)
-    int next_free_block;                 // Índice del primer bloque libre
-} FAT;
+    char name[MAX_NAME_LENGTH];
+    size_t size;
+    size_t block_indices[MAX_BLOCKS_PER_ENTRY];
+    size_t block_count; 
+} Entry;
 
 typedef struct {
-    char *output_filename;
-    char **input_filenames;
-    int num_files;
-} CreateArgs;
+    Entry entries[MAX_ENTRIES];
+    size_t entry_count;
+    size_t free_block_indices[TOTAL_BLOCKS];
+    size_t free_block_count;
+} FileAllocationTable;
+
+typedef struct {
+    unsigned char content[BLOCK_SIZE];
+} DataBlock;
 
 
-void initialize_fat(FAT *fat) {
-    memset(fat, 0, sizeof(FAT));
-    for (int i = 0; i < MAX_BLOCKS; i++) {
-        fat->free_blocks[i] = 0;
-    }
-    fat->next_free_block = 0;
-}
-
-int assign_blocks(FAT *fat, int num_blocks_needed) {
-    int block_count = 0;
-    int start_block = -1;
-    for (int i = fat->next_free_block; i < MAX_BLOCKS && block_count < num_blocks_needed; i++) {
-        if (fat->free_blocks[i] == 0) {
-            if (start_block == -1) start_block = i;
-            block_count++;
-        } else {
-            start_block = -1;
-            block_count = 0;
+size_t locate_empty_block(FileAllocationTable *fat) {
+    for (size_t i = 0; i < fat->free_block_count; i++) {
+        if (fat->free_block_indices[i] != 0) {
+            size_t free_block = fat->free_block_indices[i];
+            fat->free_block_indices[i] = 0;
+            return free_block;
         }
     }
-    if (block_count == num_blocks_needed) {
-        for (int i = start_block; i < start_block + num_blocks_needed; i++) {
-            fat->free_blocks[i] = 1;
-        }
-        fat->next_free_block = start_block + num_blocks_needed;
-        return start_block;
-    }
-    return -1;
+    return (size_t)-1;
 }
 
-void create_archive(char *output_filename, int num_files, char *input_filenames[]) {
-    FAT fat;
-    initialize_fat(&fat);
+void enlarge_archive(FILE *archive, FileAllocationTable *fat) {
+    fseek(archive, 0, SEEK_END);
+    size_t current_size = ftell(archive);
+    size_t expanded_size = current_size + BLOCK_SIZE;
+    ftruncate(fileno(archive), expanded_size);
+    fat->free_block_indices[fat->free_block_count++] = current_size;
+}
 
-    FILE *output_file = fopen(output_filename, "wb+");
-    if (!output_file) {
-        perror("Failed to open output file");
+void print_archive_files(const char *archive_name, bool verbose) {
+    FILE *archive = fopen(archive_name, "rb");
+    if (archive == NULL) {
+        fprintf(stderr, "Error: No se pudo abrir el archivo empaquetado.\n");
         return;
     }
+
+    FileAllocationTable fat;
+    fread(&fat, sizeof(FileAllocationTable), 1, archive);
+
+    printf("Contenido del archivo empacado:\n");
+    printf("%-20s %-10s %s\n", "Nombre del archivo", "Tamaño", "Bloques");
+    printf("%-20s %-10s %s\n", "-------------------", "----------", "------");
+
+    for (size_t i = 0; i < fat.entry_count; i++) {
+        Entry entry = fat.entries[i];
+        printf("%-20s %-10zu ", entry.name, entry.size);
+
+        if (verbose) {
+            printf("  [");
+            for (size_t j = 0; j < entry.block_count; j++) {
+                printf("%zu", entry.block_indices[j]);
+                if (j < entry.block_count - 1) {
+                    printf(", ");
+                }
+            }
+            printf("]");
+        }
+        printf("\n");
+    }
+
+    fclose(archive);
+}
+
+void save_data_block(FILE *archive, DataBlock *block, size_t position) {
+    fseek(archive, position, SEEK_SET);
+    fwrite(block, sizeof(DataBlock), 1, archive);
+}
+
+void refresh_file_table(FileAllocationTable *fat, const char *filename, size_t file_size, size_t block_position, size_t bytes_read) {
+    for (size_t i = 0; i < fat->entry_count; i++) {
+        if (strcmp(fat->entries[i].name, filename) == 0) {
+            fat->entries[i].block_indices[fat->entries[i].block_count++] = block_position;
+            fat->entries[i].size += bytes_read;
+            return;
+        }
+    }
+
+    Entry new_entry;
+    strncpy(new_entry.name, filename, MAX_NAME_LENGTH);
+    new_entry.size = file_size + bytes_read;
+    new_entry.block_indices[0] = block_position;
+    new_entry.block_count = 1;
+    fat->entries[fat->entry_count++] = new_entry;
+}
+
+void save_file_table(FILE *archive, FileAllocationTable *fat) {
+    fseek(archive, 0, SEEK_SET);
+    fwrite(fat, sizeof(FileAllocationTable), 1, archive);
+}
+
+void build_archive(bool verbose, bool debug, const char *outputFile, bool file, char *inputFiles[], int numInputFiles) {
+    if (verbose) printf("Creando el archivo empaquetado: %s\n", outputFile);
+    FILE *archive = fopen(outputFile, "wb");
+
+    if (archive == NULL) {
+        fprintf(stderr, "Error: No se pudo abrir el archivo empaquetado '%s'.\n", outputFile);
+        exit(1);
+    }
+
+    // Inicializar la estructura FileAllocationTable
+    FileAllocationTable fat;
+    memset(&fat, 0, sizeof(FileAllocationTable));
+
+    fat.free_block_indices[0] = sizeof(FileAllocationTable);
+    fat.free_block_count = 1;
+
+    fwrite(&fat, sizeof(FileAllocationTable), 1, archive);
+
+    if (file && numInputFiles > 0) {
+        for (int i = 0; i < numInputFiles; i++) {
+            FILE *input_file = fopen(inputFiles[i], "rb");
+            if (input_file == NULL) {
+                fprintf(stderr, "Error: No se pudo abrir el archivo: '%s'.\n", inputFiles[i]);
+                exit(1);
+            }
+
+            if (verbose) printf("\n------------------------------\n");
+            if (verbose) printf("Agregando el archivo: '%s'\n", inputFiles[i]);
+
+            size_t file_size = 0;
+            size_t block_count = 0;
+            DataBlock block;
+            size_t bytes_read;
+
+            while ((bytes_read = fread(&block, 1, sizeof(DataBlock), input_file)) > 0) {
+                size_t block_position = locate_empty_block(&fat);
+                if (block_position == (size_t)-1) {
+                    if (debug) {
+                        printf("Info: Expandiendo el archivo empaquetado por falta de bloques libres.\n");
+                    }
+                    enlarge_archive(archive, &fat);
+                    block_position = locate_empty_block(&fat);
+                    if (debug) {
+                        printf("Info: Nuevo bloque libre encontrado en la posición %zu.\n", block_position);
+                    }
+                }
+
+                if (bytes_read < sizeof(DataBlock)) {
+                    memset((char*)&block + bytes_read, 0, sizeof(DataBlock) - bytes_read);
+                }
+
+                save_data_block(archive, &block, block_position);
+                refresh_file_table(&fat, inputFiles[i], file_size, block_position, bytes_read);
+
+                file_size += bytes_read;
+                block_count++;
+
+                if (debug) {
+                    printf("Info: Escribiendo bloque %zu del archivo '%s' en la posición %zu.\n", block_count, inputFiles[i], block_position);
+                }
+            }
+
+            if (verbose) printf("Tamaño final del archivo '%s': %zu bytes.\n", inputFiles[i], file_size);
+            if (verbose) printf("------------------------------\n");
+
+            fclose(input_file);
+        }
+    } else {
+        if (verbose) {
+            printf("Leyendo datos desde la entrada estándar (stdin)...\n");
+        }
+
+        size_t file_size = 0;
+        size_t block_count = 0;
+        DataBlock block;
+        size_t bytes_read;
+        while ((bytes_read = fread(&block, 1, sizeof(DataBlock), stdin)) > 0) {
+            size_t block_position = locate_empty_block(&fat);
+            if (block_position == (size_t)-1) {
+                enlarge_archive(archive, &fat);
+                block_position = locate_empty_block(&fat);
+            }
+
+            if (bytes_read < sizeof(DataBlock)) {
+                memset((char*)&block + bytes_read, 0, sizeof(DataBlock) - bytes_read);
+            }
+
+            save_data_block(archive, &block, block_position);
+            refresh_file_table(&fat, "stdin", file_size, block_position, bytes_read);
+
+            file_size += bytes_read;
+            block_count++;
+
+            if (debug) {
+                printf("Info: Escribiendo bloque %zu desde stdin en la posición %zu.\n", block_count, block_position);
+            }
+        }
+    }
+
+    // Escribir la estructura FileAllocationTable actualizada en el archivo
+    save_file_table(archive, &fat);
+    fclose(archive);
+}
+
+void remove_files_from_archive(const char *archive_name, char **filenames, int num_files, bool verbose, bool debug) {
+    FILE *archive = fopen(archive_name, "rb+");
+    if (archive == NULL) {
+        fprintf(stderr, "Error: No se pudo abrir el archivo empaquetado '%s' para modificación.\n", archive_name);
+        return;
+    }
+
+    FileAllocationTable fat;
+    fread(&fat, sizeof(FileAllocationTable), 1, archive);
 
     for (int i = 0; i < num_files; i++) {
-        FILE *input_file = fopen(input_filenames[i], "rb");
-        if (!input_file) {
-            fprintf(stderr, "Failed to open input file %s\n", input_filenames[i]);
-            continue;
+        const char *filename = filenames[i];
+        bool file_found = false;
+
+        for (size_t j = 0; j < fat.entry_count; j++) {
+            if (strcmp(fat.entries[j].name, filename) == 0) {
+                file_found = true;
+
+                // Marcar los bloques como libres
+                for (size_t k = 0; k < fat.entries[j].block_count; k++) {
+                    fat.free_block_indices[fat.free_block_count++] = fat.entries[j].block_indices[k];
+                    if (debug) {
+                        printf("Info: Bloque %zu del archivo '%s' marcado como libre.\n", fat.entries[j].block_indices[k], filename);
+                    }
+                }
+
+                // Eliminar la entrada del archivo del FAT
+                for (size_t k = j; k < fat.entry_count - 1; k++) {
+                    fat.entries[k] = fat.entries[k + 1];
+                }
+                fat.entry_count--;
+
+                if (verbose) {
+                    printf("Info: Archivo '%s' eliminado del archivo empaquetado '%s'.\n", filename, archive_name);
+                }
+
+                break;
+            }
         }
 
-        fseek(input_file, 0, SEEK_END);
-        int file_size = ftell(input_file);
-        fseek(input_file, 0, SEEK_SET);
-        int num_blocks_needed = (file_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-
-        printf("Writing to archive: %s, size: %d\n", input_filenames[i], file_size);
-        int start_block = assign_blocks(&fat, num_blocks_needed);
-        if (start_block == -1) {
-            fprintf(stderr, "Failed to allocate space for file %s\n", input_filenames[i]);
-            fclose(input_file);
-            continue;
+        if (!file_found) {
+            fprintf(stderr, "Error: Archivo '%s' no encontrado en el archivo empaquetado '%s'.\n", filename, archive_name);
         }
-
-        fseek(output_file, start_block * BLOCK_SIZE, SEEK_SET);
-        char buffer[BLOCK_SIZE];
-        int bytes_read;
-        while ((bytes_read = fread(buffer, 1, BLOCK_SIZE, input_file)) > 0) {
-            printf("Read %d bytes, writing to block starting at %ld\n", bytes_read, (long)(start_block * BLOCK_SIZE));
-            fwrite(buffer, 1, bytes_read, output_file);
-        }
-
-        strcpy(fat.files[i].filename, input_filenames[i]);
-        fat.files[i].start_block = start_block;
-        fat.files[i].num_blocks = num_blocks_needed;
-        fat.files[i].file_size = file_size;
-
-        fclose(input_file);
     }
 
-    fseek(output_file, 0, SEEK_SET);
-    fwrite(&fat, sizeof(FAT), 1, output_file);
+    // Escribir la estructura FileAllocationTable actualizada en el archivo
+    fseek(archive, 0, SEEK_SET);
+    fwrite(&fat, sizeof(FileAllocationTable), 1, archive);
 
-    fclose(output_file);
+    fclose(archive);
 }
 
 
-void extract_archive(char *archive_filename) {
-    FILE *archive_file = fopen(archive_filename, "rb");
-    if (!archive_file) {
-        perror("Failed to open archive file for reading");
+void retrieve_archive(const char *archive_name, bool verbose, bool debug) {
+    FILE *archive = fopen(archive_name, "rb");
+    if (archive == NULL) {
+        fprintf(stderr, "Error: No se pudo abrir el archivo empaquetado '%s' para lectura.\n", archive_name);
         return;
     }
 
-    FAT fat;
-    if (fread(&fat, sizeof(FAT), 1, archive_file) != 1) {
-        perror("Failed to read FAT from archive file");
-        fclose(archive_file);
-        return;
-    }
+    FileAllocationTable fat;
+    fread(&fat, sizeof(FileAllocationTable), 1, archive);
 
-    for (int i = 0; i < MAX_FILES; i++) {
-        if (fat.files[i].file_size == 0) {
-            break;
-        }
-
-        char *output_filename = fat.files[i].filename;
-        FILE *output_file = fopen(output_filename, "wb");
-        if (!output_file) {
-            fprintf(stderr, "Failed to open output file %s for writing\n", output_filename);
+    for (size_t i = 0; i < fat.entry_count; i++) {
+        Entry entry = fat.entries[i];
+        FILE *output_file = fopen(entry.name, "wb");
+        if (output_file == NULL) {
+            fprintf(stderr, "Error: No se pudo crear el archivo de salida '%s'.\n", entry.name);
             continue;
         }
 
-        int bytes_to_read = fat.files[i].file_size;
-        fseek(archive_file, fat.files[i].start_block * BLOCK_SIZE, SEEK_SET);
-        printf("Extracting file: %s, size: %d\n", output_filename, fat.files[i].file_size);
-        char buffer[BLOCK_SIZE];
-        while (bytes_to_read > 0) {
-            memset(buffer, 0, BLOCK_SIZE);  // Clear the buffer before reading
-            int bytes_read = fread(buffer, 1, (bytes_to_read > BLOCK_SIZE ? BLOCK_SIZE : bytes_to_read), archive_file);
-            if (bytes_read <= 0) {
-                perror("Failed to read data from archive file");
-                break;
+        if (verbose) {
+            printf("Extrayendo archivo: '%s'\n", entry.name);
+        }
+
+        size_t file_size = 0;
+        for (size_t j = 0; j < entry.block_count; j++) {
+            DataBlock block;
+            fseek(archive, entry.block_indices[j], SEEK_SET);
+            fread(&block, sizeof(DataBlock), 1, archive);
+
+            size_t bytes_to_write = (file_size + sizeof(DataBlock) > entry.size) ? entry.size - file_size : sizeof(DataBlock);
+            fwrite(&block, 1, bytes_to_write, output_file);
+
+            file_size += bytes_to_write;
+
+            if (debug) {
+                printf("Info: Bloque %zu del archivo '%s' extraído de la posición %zu.\n", j + 1, entry.name, entry.block_indices[j]);
             }
-            printf("Read %d bytes\n", bytes_read);
-            fwrite(buffer, 1, bytes_read, output_file);
-            bytes_to_read -= bytes_read;
         }
 
         fclose(output_file);
     }
 
-    fclose(archive_file);
+    fclose(archive);
 }
 
-void list_archive_contents(char *archive_filename) {
-    FILE *archive_file = fopen(archive_filename, "rb");
-    if (!archive_file) {
-        perror("Failed to open archive file for reading");
+
+void modify_files_in_archive(const char *archive_name, char **filenames, int num_files, bool verbose, bool debug) {
+    FILE *archive = fopen(archive_name, "rb+");
+    if (archive == NULL) {
+        fprintf(stderr, "Error: No se pudo abrir el archivo empaquetado '%s' para modificación.\n", archive_name);
         return;
     }
 
-    FAT fat;
-    if (fread(&fat, sizeof(FAT), 1, archive_file) != 1) {
-        perror("Failed to read FAT from archive file");
-        fclose(archive_file);
-        return;
-    }
+    FileAllocationTable fat;
+    fread(&fat, sizeof(FileAllocationTable), 1, archive);
 
-    printf("List of files in the archive:\n");
-    for (int i = 0; i < MAX_FILES; i++) {
-        if (fat.files[i].file_size == 0) {  // Assume file_size 0 as the end of valid entries
-            break;
+    for (int i = 0; i < num_files; i++) {
+        const char *filename = filenames[i];
+        bool file_found = false;
+
+        for (size_t j = 0; j < fat.entry_count; j++) {
+            if (strcmp(fat.entries[j].name, filename) == 0) {
+                file_found = true;
+
+                // Marcar los bloques anteriores como libres
+                for (size_t k = 0; k < fat.entries[j].block_count; k++) {
+                    fat.free_block_indices[fat.free_block_count++] = fat.entries[j].block_indices[k];
+                    if (debug) {
+                        printf("Info: El bloque %zu del archivo '%s' se ha marcado como libre.\n", fat.entries[j].block_indices[k], filename);
+                    }
+                }
+
+                // Leer el contenido actualizado del archivo
+                FILE *input_file = fopen(filename, "rb");
+                if (input_file == NULL) {
+                    fprintf(stderr, "Error: No se pudo abrir el archivo de entrada '%s'.\n", filename);
+                    continue;
+                }
+
+                size_t file_size = 0;
+                size_t block_count = 0;
+                DataBlock block;
+                size_t bytes_read;
+                while ((bytes_read = fread(&block, 1, sizeof(DataBlock), input_file)) > 0) {
+                    size_t block_position = locate_empty_block(&fat);
+                    if (block_position == (size_t)-1) {
+                        enlarge_archive(archive, &fat);
+                        block_position = locate_empty_block(&fat);
+                    }
+
+                    save_data_block(archive, &block, block_position);
+                    fat.entries[j].block_indices[block_count++] = block_position;
+
+                    file_size += bytes_read;
+
+                    if (debug) {
+                        printf("Info: Bloque %zu del archivo '%s' actualizado en la posición %zu.\n", block_count, filename, block_position);
+                    }
+                }
+
+                fat.entries[j].size = file_size;
+                fat.entries[j].block_count = block_count;
+
+                fclose(input_file);
+
+                if (verbose) {
+                    printf("Info: El archivo '%s' se ha actualizado en el archivo empaquetado '%s'.\n", filename, archive_name);
+                }
+
+                break;
+            }
         }
-        printf("File: %s, Size: %d bytes, Blocks: %d\n",
-               fat.files[i].filename,
-               fat.files[i].file_size,
-               fat.files[i].num_blocks);
+
+        if (!file_found) {
+            fprintf(stderr, "Error: El archivo '%s' no se encontró en el archivo empaquetado '%s'.\n", filename, archive_name);
+        }
     }
 
-    fclose(archive_file);
+    // Escribir la estructura FileAllocationTable actualizada en el archivo
+    fseek(archive, 0, SEEK_SET);
+    fwrite(&fat, sizeof(FileAllocationTable), 1, archive);
+
+    fclose(archive);
 }
 
+void optimize_archive(const char *archive_name, bool verbose, bool debug) {
+    // Abrir el archivo empaquetado para lectura y escritura
+    FILE *archive = fopen(archive_name, "rb+");
+    if (archive == NULL) {
+        fprintf(stderr, "Error: No se pudo abrir el archivo empaquetado '%s' para modificación.\n", archive_name);
+        return;
+    }
+
+    // Leer la estructura FileAllocationTable del archivo
+    FileAllocationTable fat;
+    fread(&fat, sizeof(FileAllocationTable), 1, archive);
+
+    size_t new_block_position = sizeof(FileAllocationTable);  // Nueva posición de inicio para los bloques
+    for (size_t i = 0; i < fat.entry_count; i++) {
+        Entry *entry = &fat.entries[i];
+
+        for (size_t j = 0; j < entry->block_count; j++) {
+            DataBlock block;
+            // Leer el bloque actual desde su posición en el archivo
+            fseek(archive, entry->block_indices[j], SEEK_SET);
+            fread(&block, sizeof(DataBlock), 1, archive);
+
+            // Escribir el bloque en la nueva posición
+            fseek(archive, new_block_position, SEEK_SET);
+            fwrite(&block, sizeof(DataBlock), 1, archive);
+
+            // Actualizar la posición del bloque en la entrada del archivo
+            entry->block_indices[j] = new_block_position;
+            new_block_position += sizeof(DataBlock);
+
+            if (debug) {
+                printf("Info: El bloque %zu del archivo '%s' se ha movido a la posición %zu.\n", j + 1, entry->name, entry->block_indices[j]);
+            }
+        }
+
+        if (verbose) {
+            printf("Info: El archivo '%s' se ha desfragmentado.\n", entry->name);
+        }
+    }
+
+    // Actualizar la estructura FileAllocationTable con los nuevos bloques libres
+    fat.free_block_count = 0;    
+    size_t remaining_space = new_block_position;
+    while (remaining_space < fat.free_block_indices[fat.free_block_count - 1]) {
+        fat.free_block_indices[fat.free_block_count++] = remaining_space;
+        remaining_space += sizeof(DataBlock);
+    }
+
+    // Escribir la estructura FileAllocationTable actualizada en el archivo
+    fseek(archive, 0, SEEK_SET);
+    fwrite(&fat, sizeof(FileAllocationTable), 1, archive);
+
+    // Truncar el archivo para eliminar el espacio no utilizado
+    ftruncate(fileno(archive), new_block_position);
+
+    fclose(archive);
+}
+
+void add_files_to_archive(const char *archive_name, char **filenames, int num_files, bool verbose, bool debug) {
+    // Abrir el archivo empaquetado para lectura y escritura
+    FILE *archive = fopen(archive_name, "rb+");
+    if (archive == NULL) {
+        fprintf(stderr, "Error: No se pudo abrir el archivo empaquetado '%s' para modificación.\n", archive_name);
+        return; 
+    }
+
+    // Leer la estructura FileAllocationTable del archivo
+    FileAllocationTable fat;
+    fread(&fat, sizeof(FileAllocationTable), 1, archive);
+
+    if (num_files == 0) {
+        // Leer desde la entrada estándar (stdin)
+        const char *filename = "stdin";
+        size_t file_size = 0;
+        size_t block_count = 0;
+        DataBlock block;
+        size_t bytes_read;
+        while ((bytes_read = fread(&block, 1, sizeof(DataBlock), stdin)) > 0) {
+            size_t block_position = locate_empty_block(&fat);
+            if (block_position == (size_t)-1) {
+                // Expandir el archivo si no hay bloques libres
+                enlarge_archive(archive, &fat);
+                block_position = locate_empty_block(&fat);
+            }
+
+            // Escribir el bloque en la nueva posición
+            save_data_block(archive, &block, block_position);
+            refresh_file_table(&fat, filename, file_size, block_position, bytes_read);
+
+            file_size += bytes_read;
+            block_count++;
+
+            if (debug) {
+                printf("Info: Bloque %zu leído desde stdin y agregado en la posición %zu.\n", block_count, block_position);
+            }
+        }
+
+        if (verbose) {
+            printf("Info: Contenido de stdin agregado al archivo empaquetado como '%s'.\n", filename);
+        }   
+    } else {
+        // Agregar archivos especificados
+        for (int i = 0; i < num_files; i++) {
+            const char *filename = filenames[i];
+            FILE *input_file = fopen(filename, "rb");
+            if (input_file == NULL) {
+                fprintf(stderr, "Error: No se pudo abrir el archivo de entrada '%s'.\n", filename);
+                continue;
+            }
+
+            size_t file_size = 0;
+            size_t block_count = 0;
+            DataBlock block;
+            size_t bytes_read;  
+            while ((bytes_read = fread(&block, 1, sizeof(DataBlock), input_file)) > 0) {
+                size_t block_position = locate_empty_block(&fat);
+                if (block_position == (size_t)-1) {
+                    // Expandir el archivo si no hay bloques libres
+                    enlarge_archive(archive, &fat);
+                    block_position = locate_empty_block(&fat);
+                }
+
+                // Escribir el bloque en la nueva posición
+                save_data_block(archive, &block, block_position);
+                refresh_file_table(&fat, filename, file_size, block_position, bytes_read);
+
+                file_size += bytes_read;
+                block_count++;
+
+                if (debug) {
+                    printf("Info: Bloque %zu del archivo '%s' agregado en la posición %zu.\n", block_count, filename, block_position);
+                }
+            }
+
+            fclose(input_file);
+
+            if (verbose) {
+                printf("Info: Archivo '%s' agregado al archivo empaquetado.\n", filename);
+            }
+        }
+    }
+
+    // Escribir la estructura FileAllocationTable actualizada en el archivo
+    fseek(archive, 0, SEEK_SET);
+    fwrite(&fat, sizeof(FileAllocationTable), 1, archive);
+
+    fclose(archive);
+}
+
+// Función para validar que el archivo tenga la extensión .tar
+bool validate_tar_extension(const char *filename) {
+    const char *tar_ext = ".tar";
+    size_t len = strlen(filename);
+    return len >= 4 && strcmp(filename + len - 4, tar_ext) == 0;
+}
 
 void print_usage(char *program_name) {
     printf("Uso: %s [opciones] [argumentos]\n", program_name);
@@ -202,65 +563,111 @@ void print_usage(char *program_name) {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        print_usage(argv[0]);
-        return EXIT_FAILURE;
-    }
-
+    bool create = false;
+    bool extract = false;
+    bool list = false;
+    bool delete = false;
+    bool update = false;
+    bool verbose = false;
+    bool debug = false;  
+    bool file = false;
+    bool append = false;
+    bool pack = false;
+    char *outputFile = NULL;
+    char **inputFiles = NULL;
+    int numInputFiles = 0;
     int opt;
-    int create_flag = 0, extract_flag = 0, list_flag = 0;
-    char *filename = NULL;
 
     static struct option long_options[] = {
-        {"create", no_argument, 0, 'c'},
-        {"extract", no_argument, 0, 'x'},
-        {"list", no_argument, 0, 't'},
-        {"delete", no_argument, 0, 'd'},
-        {"update", no_argument, 0, 'u'},
-        {"verbose", no_argument, 0, 'v'},
-        {"file", required_argument, 0, 'f'},
-        {"append", no_argument, 0, 'r'},
-        {"pack", no_argument, 0, 'p'},
+        {"create",      no_argument,       0, 'c'},
+        {"extract",     no_argument,       0, 'x'},
+        {"list",        no_argument,       0, 't'},
+        {"delete",      no_argument,       0, 'd'},
+        {"update",      no_argument,       0, 'u'},
+        {"verbose",     no_argument,       0, 'v'},
+        {"file",        no_argument,       0, 'f'},
+        {"append",      no_argument,       0, 'r'},
+        {"pack",        no_argument,       0, 'p'},
         {0, 0, 0, 0}
     };
 
-    while ((opt = getopt_long(argc, argv, "cxtduvrf:pa", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "cxtduvfrp", long_options, NULL)) != -1) {
         switch (opt) {
             case 'c':
-                create_flag = 1;
+                create = true;
                 break;
             case 'x':
-                extract_flag = 1;
+                extract = true;
                 break;
             case 't':
-                list_flag = 1;
+                list = true;
                 break;
-            case 'f':
-                filename = optarg;
+            case 'd':
+                delete = true;
+                break;
+            case 'u':
+                update = true;
                 break;
             case 'v':
-                // Implement verbose or other flags as needed
+                if (verbose) {
+                    debug = true;  
+                }
+                verbose = true;
+                break;
+            case 'f':
+                file = true;
+                break;
+            case 'r':
+                append = true;
+                break;
+            case 'p':
+                pack = true;
                 break;
             default:
                 print_usage(argv[0]);
-                return EXIT_FAILURE;
+                return EXIT_FAILURE;                
         }
     }
 
-    if (create_flag && filename) {
-        printf("Creating an archive with the file: %s\n", filename);
-        // Assuming that you process the rest of the files after '-f' in `create_archive`
-        create_archive(filename, argc - optind, &argv[optind]);
-    } else if (extract_flag && filename) {
-        printf("Extracting files from the archive: %s\n", filename);
-        extract_archive(filename);
-    } else if (list_flag && filename) {
-        printf("Listing contents of the archive: %s\n", filename);
-        list_archive_contents(filename);
+    if (optind < argc) {
+        outputFile = argv[optind++];
+
+        // Validar la extensión .tar para las opciones que requieren un archivo .tar
+        if (create || extract || list || delete || update || append || pack) {
+            if (!validate_tar_extension(outputFile)) {
+                fprintf(stderr, "Error: El archivo de salida debe tener la extensión .tar\n");
+                return 1;
+            }
+        }
     } else {
-        fprintf(stderr, "Invalid operation or no filename specified.\n");
-        print_usage(argv[0]);
-        return EXIT_FAILURE;
+        if (create || extract || list || delete || update || append || pack) {
+            fprintf(stderr, "Error: Se debe especificar un archivo de salida con la extensión .tar\n");
+            return 1;
+        }
+    }
+
+    numInputFiles = argc - optind;
+    if (numInputFiles > 0) {
+        inputFiles = &argv[optind];
+    }
+
+    if (create) {
+        build_archive(verbose, debug, outputFile, file, inputFiles, numInputFiles);
+    } else if (extract) {
+        retrieve_archive(outputFile, verbose, debug);
+    } else if (delete) {
+        remove_files_from_archive(outputFile, inputFiles, numInputFiles, verbose, debug);
+    } else if (update) {
+        modify_files_in_archive(outputFile, inputFiles, numInputFiles, verbose, debug);
+    } else if (append) {
+        add_files_to_archive(outputFile, inputFiles, numInputFiles, verbose, debug);
+    }
+
+    if (pack) {
+        optimize_archive(outputFile, verbose, debug);
+    }
+    if (list) {
+        print_archive_files(outputFile, verbose);
     }
 
     return 0;
